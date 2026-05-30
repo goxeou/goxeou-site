@@ -1,0 +1,5 @@
+Array
+(
+    [errcode] => 40001
+    [errmsg] => invalid credential, access_token is invalid or not latest, rid: 67dbaed4-330c76a8-67b80734
+)

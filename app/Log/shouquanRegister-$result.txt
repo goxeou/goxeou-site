@@ -1,0 +1,18 @@
+Array
+(
+    [openid] => ogeQF6r85XOJePVaI79MDhCqvh54
+    [nickname] => 、开心的一凤
+    [sex] => 0
+    [language] => 
+    [city] => 
+    [province] => 
+    [country] => 
+    [headimgurl] => https://thirdwx.qlogo.cn/mmopen/vi_32/umGKD2CcK8b5s1IbrQ3aDP4BiaJkia25NiaVYL4YcfARL3u5Ou2FHibrLiaCRF4m5lzM2dJk4LlPAk3iapWQTL0Sp5Ug/132
+    [privilege] => Array
+        (
+        )
+
+    [unionid] => owhwG6LIZE_74WrET0s8WgKlrRow
+    [subscribe] => 0
+    [subscribe_time] => 
+)

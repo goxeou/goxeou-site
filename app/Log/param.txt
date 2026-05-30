@@ -1,0 +1,9 @@
+Array
+(
+    [s] => /ApiImageupload/uploadImg/aid/4/platform/wx/session_id/09672d056be420507b4cec5f302cce05/sortnum/3/other_param/0
+    [aid] => 4
+    [platform] => wx
+    [session_id] => 09672d056be420507b4cec5f302cce05
+    [sortnum] => 3
+    [other_param] => 0
+)
