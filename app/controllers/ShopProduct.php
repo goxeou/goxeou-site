@@ -171,8 +171,108 @@ class ShopProduct extends Common
                 }
             }
             if(input('param.proids'))$where[] = ['id','in',input('param.proids')];
-			$count = 0 + Db::name('shop_product')->where($where)->count();
-			$data = Db::name('shop_product')->where($where)->page($page,$limit)->order($order)->select()->toArray();
+
+            // ===== 直营店引用模式：直营店商品列表包含总店映射商品 + 自营商品 =====
+            $isDirectStore = false;
+            $storeHeadBid = 0;
+            if(bid > 0){
+                $storeBiz = Db::name('business')->where('id', bid)->find();
+                if($storeBiz && $storeBiz['type'] == 1){
+                    $isDirectStore = true;
+                    $storeHeadBid = intval($storeBiz['head_bid']);
+                }
+            }
+
+            if($isDirectStore && $storeHeadBid > 0){
+                // 直营店：ORDER BY 字段加上别名避免 JOIN 歧义
+                $storeOrder = $order;
+                if(strpos($storeOrder, '.') === false){
+                    $clauses = explode(',', $storeOrder);
+                    $qualified = [];
+                    foreach($clauses as $clause){
+                        $clause = trim($clause);
+                        if(strpos($clause, '.') === false){
+                            $parts = preg_split('/\s+/', $clause);
+                            $field = $parts[0];
+                            $dir = isset($parts[1]) ? ' ' . $parts[1] : '';
+                            $qualified[] = 'sp.' . trim($field) . $dir;
+                        }else{
+                            $qualified[] = $clause;
+                        }
+                    }
+                    $storeOrder = implode(', ', $qualified);
+                }
+
+                // 直营店：移除原有的 bid 筛选条件
+                $whereNoBid = [];
+                foreach($where as $w){
+                    if(is_array($w) && isset($w[0]) && $w[0] == 'bid'){
+                        continue;
+                    }
+                    // 带 JOIN 的查询，字段加上别名避免歧义
+                    if(is_array($w) && isset($w[0]) && is_string($w[0]) && strpos($w[0], '.') === false && strpos($w[0], 'raw') === false){
+                        if(!($w[0] instanceof \think\db\Raw)){
+                            $w[0] = 'sp.' . $w[0];
+                        }
+                    }
+                    $whereNoBid[] = $w;
+                }
+
+                // 获取映射的总店商品ID
+                $storeProids = Db::name('shop_product_store')->where('bid', bid)->column('proid');
+                if(!$storeProids) $storeProids = [0];
+
+                // 1) 总店映射商品（通过 shop_product_store 关联）
+                $whereStore = $whereNoBid;
+                $whereStore[] = ['sp.bid', '=', $storeHeadBid];
+                $whereStore[] = ['sp.id', 'in', $storeProids];
+                $count1 = Db::name('shop_product')->alias('sp')
+                    ->join('shop_product_store sps', 'sp.id = sps.proid AND sps.bid = ' . bid)
+                    ->where($whereStore)->count();
+                $data1 = [];
+                if($count1 > 0){
+                    $data1 = Db::name('shop_product')->alias('sp')
+                        ->field('sp.*, sps.override_price, sps.store_status as store_status, sps.stock as store_stock, sps.sort as store_sort')
+                        ->join('shop_product_store sps', 'sp.id = sps.proid AND sps.bid = ' . bid)
+                        ->where($whereStore)
+                        ->order($storeOrder)
+                        ->select()->toArray();
+                }
+
+                // 2) 直营店自营商品（sync_from_bid IS NULL，排除旧复制数据）
+                $whereSelf = $whereNoBid;
+                $whereSelf[] = ['sp.bid', '=', bid];
+                $whereSelf[] = ['sp.sync_from_bid', '=', null];
+                $count2 = Db::name('shop_product')->alias('sp')
+                    ->where($whereSelf)->count();
+                $data2 = [];
+                if($count2 > 0){
+                    $data2 = Db::name('shop_product')->alias('sp')
+                        ->field('sp.*, NULL as override_price, NULL as store_status, NULL as store_stock, NULL as store_sort')
+                        ->where($whereSelf)
+                        ->order($storeOrder)
+                        ->select()->toArray();
+                }
+
+                // 合并数据
+                $data = array_merge($data1, $data2);
+
+                // 排序（按 sort desc, id desc）
+                usort($data, function($a, $b){
+                    $sa = isset($a['store_sort']) && $a['store_sort'] !== null ? intval($a['store_sort']) : intval($a['sort']);
+                    $sb = isset($b['store_sort']) && $b['store_sort'] !== null ? intval($b['store_sort']) : intval($b['sort']);
+                    if($sa != $sb) return $sb - $sa;
+                    return intval($b['id']) - intval($a['id']);
+                });
+
+                $count = $count1 + $count2;
+                // 手动分页
+                $offset = ($page - 1) * $limit;
+                $data = array_slice($data, $offset, $limit);
+            }else{
+                $count = 0 + Db::name('shop_product')->where($where)->count();
+                $data = Db::name('shop_product')->where($where)->page($page,$limit)->order($order)->select()->toArray();
+            }
 			$cdata = Db::name('shop_category')->where('aid',aid)->column('name','id');
 			if(bid > 0){
 				$cdata2 = Db::name('shop_category2')->Field('id,name')->where('aid',aid)->where('bid',bid)->order('sort desc,id')->column('name','id');
@@ -229,6 +329,16 @@ class ShopProduct extends Common
                     ->where('rg.aid',aid)->where('rg.proid',$v['id'])->where('ro.refund_status',2)->sum('rg.refund_num');
                 $realsalenum = $sales_num-$refund_num;
 				$data[$k]['realsalenum'] = $realsalenum>0?$realsalenum:0;
+
+                // 直营店映射商品：使用 store_status 覆盖原 status（直营店上下架通过 store 表控制）
+                if(isset($v['store_status']) && $v['store_status'] !== null){
+                    $data[$k]['status'] = intval($v['store_status']);
+                    // 标记为映射商品，前端视图使用
+                    $data[$k]['is_store_mapped'] = 1;
+                }else{
+                    $data[$k]['is_store_mapped'] = 0;
+                }
+
 				if($v['status']==2){ //设置上架时间
 					if(strtotime($v['start_time']) <= time() && strtotime($v['end_time']) >= time()){
 						$data[$k]['status'] = 1;
@@ -343,7 +453,22 @@ class ShopProduct extends Common
 		if(input('param.id')){
 			$info = Db::name('shop_product')->where('aid',aid)->where('id',input('param.id/d'))->find();
 			if(!$info) showmsg('商品不存在');
-			if(bid != 0 && $info['bid']!=bid) showmsg('无权限操作');
+			// 直营店：编辑映射商品时跳转至改价页面
+			if(bid != 0){
+			    $storeBiz = Db::name('business')->where('id', bid)->find();
+			    if($storeBiz && $storeBiz['type'] == 1 && $info['bid'] != bid){
+			        // 检查是否为映射商品
+			        $mapped = Db::name('shop_product_store')
+			            ->where('proid', $info['id'])
+			            ->where('bid', bid)
+			            ->find();
+			        if($mapped){
+			            // 跳转到改价
+			            redirect((string)url('changeprice', ['proid'=>$info['id']]))->send();exit;
+			        }
+			    }
+			    if($info['bid']!=bid) showmsg('无权限操作');
+			}
 			if(bid != 0 && $info['linkid']!=0 && !getcustom('business_copy_product')) showmsg('无权限操作');
             $score_weishu = 0;
             if(getcustom('score_weishu')){
@@ -838,7 +963,34 @@ class ShopProduct extends Common
 		if(input('post.id')){
 			$product = Db::name('shop_product')->where('aid',aid)->where('id',input('post.id/d'))->find();
 			if(!$product) showmsg('商品不存在');
-			if(bid != 0 && $product['bid']!=bid) showmsg('无权限操作');
+			if(bid != 0 && $product['bid']!=bid){
+			    // 直营店：检查是否为映射商品（总店商品），只允许修改 override_price
+			    $storeBiz = Db::name('business')->where('id', bid)->find();
+			    if($storeBiz && $storeBiz['type'] == 1){
+			        $mapped = Db::name('shop_product_store')
+			            ->where('proid', $product['id'])
+			            ->where('bid', bid)
+			            ->find();
+			        if($mapped){
+			            // 只更新 override_price
+			            $info = input('post.info/a');
+			            $override_price = isset($info['override_price']) ? floatval($info['override_price']) : null;
+			            $updateData = [];
+			            if($override_price !== null){
+			                $updateData['override_price'] = $override_price > 0 ? $override_price : null;
+			            }
+			            if(!empty($updateData)){
+			                Db::name('shop_product_store')
+			                    ->where('proid', $product['id'])
+			                    ->where('bid', bid)
+			                    ->update($updateData);
+			            }
+			            \app\commons\System::plog('直营店改价：商品'.$product['id'].' override_price='.($override_price??'NULL'));
+			            return json(['status'=>1,'msg'=>'操作成功','url'=>(string)url('index')]);
+			        }
+			    }
+			    showmsg('无权限操作');
+			}
 		}
 		$info = input('post.info/a');
 		if(intval($info['sort']) >= 1000000) showmsg('商品序号不能大于1000000');
@@ -1545,6 +1697,7 @@ class ShopProduct extends Common
             }
 			$proid = $product['id'];
 			\app\commons\System::plog('商城商品编辑'.$proid);
+			\app\commons\ShopSync::syncProductUpdate($proid);
 		}else{
 			$data['aid'] = aid;
 			$data['bid'] = bid;
@@ -1554,6 +1707,7 @@ class ShopProduct extends Common
 			}
 			$proid = Db::name('shop_product')->insertGetId($data);
 			\app\commons\System::plog('商城商品编辑'.$proid);
+			\app\commons\ShopSync::syncNewProductToStores($proid);
 		}
 
 		if(getcustom('product_mendian_hexiao_givemoney')){
@@ -1900,6 +2054,51 @@ class ShopProduct extends Common
 	public function setst(){
 		$st = input('post.st/d');
 		$ids = input('post.ids/a');
+
+		// 直营店：映射商品修改 shop_product_store.store_status，自营商品正常修改
+		if(bid > 0){
+		    $storeBiz = Db::name('business')->where('id', bid)->find();
+		    if($storeBiz && $storeBiz['type'] == 1){
+		        $headBid = intval($storeBiz['head_bid']);
+		        // 分离出映射商品ID和自营商品ID
+		        $mappedIds = Db::name('shop_product_store')
+		            ->where('bid', bid)
+		            ->where('proid', 'in', $ids)
+		            ->column('proid');
+		        $selfIds = array_diff($ids, $mappedIds);
+
+		        // 映射商品：更新 shop_product_store.store_status
+		        if(!empty($mappedIds)){
+		            Db::name('shop_product_store')
+		                ->where('bid', bid)
+		                ->where('proid', 'in', $mappedIds)
+		                ->update(['store_status' => $st]);
+		        }
+
+		        // 自营商品：正常更新 shop_product.status
+		        if(!empty($selfIds)){
+		            $where = [];
+		            $where[] = ['aid','=',aid];
+		            $where[] = ['id','in',$selfIds];
+		            $where[] = ['bid','=',bid];
+		            Db::name('shop_product')->where($where)->update(['status'=>$st]);
+		        }
+
+		        $this->tongbuproduct($ids);
+		        if($st == 0){
+		            \app\commons\Wxvideo::delisting($ids);
+		        }else{
+		            \app\commons\Wxvideo::listing($ids);
+		        }
+		        if(getcustom('erp_wangdiantong')) {
+		            $c = new \app\customs\Wdt(aid,bid);
+		            $c->goodsSpecPush($ids);
+		        }
+		        \app\commons\System::plog('商城商品改状态'.implode(',',$ids));
+		        return json(['status'=>1,'msg'=>'操作成功']);
+		    }
+		}
+
 		$where = [];
 		$where[] = ['aid','=',aid];
 		$where[] = ['id','in',$ids];
@@ -1942,6 +2141,23 @@ class ShopProduct extends Common
 	public function del(){
 		$ids = input('post.ids/a');
 		if(!$ids) $ids = array(input('post.id/d'));
+		
+		// 直营店不能删除总部同步商品
+		if(bid > 0){
+		    $business = Db::name('business')->where('id',bid)->find();
+		    if($business && $business['type'] == 1){
+		        $syncedCount = Db::name('shop_product')
+		            ->where('aid',aid)
+		            ->where('bid',bid)
+		            ->where('id','in',$ids)
+		            ->whereNotNull('sync_from_bid')
+		            ->count();
+		        if($syncedCount > 0){
+		            return json(['status'=>0,'msg'=>'直营店不能删除总部同步商品']);
+		        }
+		    }
+		}
+		
 		$where = [];
 		$where[] = ['aid','=',aid];
 		$where[] = ['id','in',$ids];
@@ -1976,6 +2192,9 @@ class ShopProduct extends Common
                 Db::name('shop_guige')->where('proid',$pro['id'])->delete();
             }
         }
+		foreach($ids as $delId) {
+		    \app\commons\ShopSync::syncProductDelete($delId);
+		}
 		\app\commons\System::plog('商城商品删除'.implode(',',$ids));
 		return json(['status'=>1,'msg'=>'删除成功']);
 	}
@@ -4203,6 +4422,16 @@ class ShopProduct extends Common
                     ->where('rg.aid',aid)->where('rg.proid',$v['id'])->where('ro.refund_status',2)->sum('rg.refund_num');
                 $realsalenum = $sales_num-$refund_num;
 				$data[$k]['realsalenum'] = $realsalenum>0?$realsalenum:0;
+
+                // 直营店映射商品：使用 store_status 覆盖原 status（直营店上下架通过 store 表控制）
+                if(isset($v['store_status']) && $v['store_status'] !== null){
+                    $data[$k]['status'] = intval($v['store_status']);
+                    // 标记为映射商品，前端视图使用
+                    $data[$k]['is_store_mapped'] = 1;
+                }else{
+                    $data[$k]['is_store_mapped'] = 0;
+                }
+
 				if($v['status']==2){ //设置上架时间
 					if(strtotime($v['start_time']) <= time() && strtotime($v['end_time']) >= time()){
 						$data[$k]['status'] = 1;
